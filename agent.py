@@ -1,5 +1,6 @@
 """
 AR for Softr — QBO to Softr Database sync
+Аналог ar-for-comments/agent.py, но пишет в Softr Database вместо Google Sheets.
 """
 import os, base64, httpx
 from datetime import date, datetime, timezone
@@ -9,6 +10,8 @@ QBO_API_BASE = "https://quickbooks.api.intuit.com/v3/company"
 DAYS_AHEAD = 30
 
 GITHUB_API = "https://api.github.com"
+# Единственный источник правды для QBO_REFRESH_TOKEN — репозиторий ar-for-comments.
+# Этот скрипт (как и QBO MCP) только ЧИТАЕТ токен оттуда через GitHub API, никогда не пишет обратно.
 QBO_TOKEN_SOURCE_REPO = "IrKov1971/ar-for-comments"
 
 SOFTR_API_BASE = "https://tables-api.softr.io/api/v1"
@@ -28,6 +31,8 @@ def get_qbo_refresh_token_from_github(gh_pat):
     return r.json()["value"].strip()
 
 
+# ---------- QBO (без изменений в логике относительно ar-for-comments) ----------
+
 def get_qbo_access_token(client_id, client_secret, refresh_token):
     client_id = client_id.strip()
     client_secret = client_secret.strip()
@@ -45,6 +50,8 @@ def get_qbo_access_token(client_id, client_secret, refresh_token):
         timeout=30,
     )
     r.raise_for_status()
+    # ВАЖНО: этот скрипт НЕ пишет новый refresh_token обратно в GitHub —
+    # единственный источник правды и "хозяин" токена — ar-for-comments (см. CLAUDE.md)
     return r.json()["access_token"]
 
 
@@ -62,7 +69,7 @@ def qbo_query(realm_id, access_token, query):
 def fetch_unpaid_invoices(realm_id, access_token):
     invoices, start, page = [], 1, 1000
     while True:
-        data = qbo_query(realm_id, access_token, f"SELECT * FROM Invoice WHERE Balance > \'0\' STARTPOSITION {start} MAXRESULTS {page}")
+        data = qbo_query(realm_id, access_token, f"SELECT * FROM Invoice WHERE Balance > '0' STARTPOSITION {start} MAXRESULTS {page}")
         batch = data.get("QueryResponse", {}).get("Invoice", []) or []
         if not batch:
             break
@@ -90,6 +97,7 @@ def fetch_customer_map(realm_id, access_token):
 
 
 def enrich_invoices(invoices, customer_map):
+    """Для партнёрских инвойсов (ProjectRef заполнен) — добавляем имя партнёра спереди."""
     for inv in invoices:
         if not inv.get("ProjectRef"):
             continue
@@ -98,7 +106,7 @@ def enrich_invoices(invoices, customer_map):
         if customer and customer.get("ParentRef"):
             parent = customer_map.get(customer["ParentRef"]["value"])
             if parent:
-                ref["name"] = f"{parent[\'DisplayName\']}:{ref.get(\'name\', \'\')}"
+                ref["name"] = f"{parent['DisplayName']}:{ref.get('name', '')}"
 
 
 def parse_date(s):
@@ -136,12 +144,14 @@ def format_fields_by_name(inv):
     return {
         "customer": inv.get("CustomerRef", {}).get("name", ""),
         "amount": balance,
-        "due_date": due.isoformat(),
+        "due_date": due.isoformat(),  # YYYY-MM-DD
         "status": compute_status(due, today),
-        "days_overdue": -days_delta if days_delta < 0 else 0,
+        "days_overdue": -days_delta if days_delta < 0 else 0,  # для фильтров/цвета в Softr
         "invoice_number": inv.get("DocNumber", ""),
     }
 
+
+# ---------- Softr Database API ----------
 
 def softr_headers(api_key):
     return {
@@ -175,6 +185,7 @@ def to_field_ids(fields_by_name, name_to_id):
 
 
 def fetch_all_softr_records(database_id, table_id, api_key):
+    """Постранично забираем все текущие записи таблицы AR."""
     records, offset, limit = [], 0, 100
     while True:
         r = httpx.get(
@@ -233,6 +244,7 @@ def sync_to_softr(database_id, table_id, api_key, invoices):
     name_to_id = get_field_name_to_id_map(database_id, table_id, api_key)
 
     existing_records = fetch_all_softr_records(database_id, table_id, api_key)
+    # invoice_number -> record, только записи с непустым invoice_number (защита от ручных тестовых строк)
     existing_by_invnum = {
         rec["fields"].get("invoice_number"): rec
         for rec in existing_records
@@ -256,6 +268,8 @@ def sync_to_softr(database_id, table_id, api_key, invoices):
 
     for num in to_update:
         record_id = existing_by_invnum[num]["id"]
+        # Обновляем только автополя — updated/point_of_contact/note не трогаем,
+        # они заполняются вручную в Softr
         fields_by_id = to_field_ids(format_fields_by_name(new_map[num]), name_to_id)
         softr_update_record(database_id, table_id, api_key, record_id, fields_by_id)
         updated += 1
@@ -269,7 +283,7 @@ def sync_to_softr(database_id, table_id, api_key, invoices):
 
 
 def main():
-    print(f"🚀 AR sync (Softr) — {datetime.now(timezone.utc).strftime(\'%Y-%m-%d %H:%M UTC\')}")
+    print(f"🚀 AR sync (Softr) — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
     refresh_token = get_qbo_refresh_token_from_github(os.environ["GH_PAT"])
     access_token = get_qbo_access_token(
