@@ -62,7 +62,7 @@ def qbo_query(realm_id, access_token, query):
 def fetch_unpaid_invoices(realm_id, access_token):
     invoices, start, page = [], 1, 1000
     while True:
-        data = qbo_query(realm_id, access_token, f"SELECT * FROM Invoice WHERE Balance > '0' STARTPOSITION {start} MAXRESULTS {page}")
+        data = qbo_query(realm_id, access_token, f"SELECT * FROM Invoice WHERE Balance > \'0\' STARTPOSITION {start} MAXRESULTS {page}")
         batch = data.get("QueryResponse", {}).get("Invoice", []) or []
         if not batch:
             break
@@ -98,7 +98,7 @@ def enrich_invoices(invoices, customer_map):
         if customer and customer.get("ParentRef"):
             parent = customer_map.get(customer["ParentRef"]["value"])
             if parent:
-                ref["name"] = f"{parent['DisplayName']}:{ref.get('name', '')}"
+                ref["name"] = f"{parent[\'DisplayName\']}:{ref.get(\'name\', \'\')}"
 
 
 def parse_date(s):
@@ -127,7 +127,8 @@ def filter_and_sort(invoices):
     return result
 
 
-def format_fields(inv):
+def format_fields_by_name(inv):
+    """Формируем поля записи по ИМЕНАМ полей (человекочитаемо)."""
     today = date.today()
     balance = float(inv.get("Balance", 0) or 0)
     due = parse_date(inv.get("DueDate", ""))
@@ -147,6 +148,30 @@ def softr_headers(api_key):
         "Softr-Api-Key": api_key.strip(),
         "Content-Type": "application/json",
     }
+
+
+def get_field_name_to_id_map(database_id, table_id, api_key):
+    """Softr Create/Update Record API принимает fields, ключованные по ID поля,
+    а не по имени (fieldNames=true влияет только на чтение). Получаем маппинг
+    имя -> ID через Get Single Table."""
+    r = httpx.get(
+        f"{SOFTR_API_BASE}/databases/{database_id}/tables/{table_id}",
+        headers=softr_headers(api_key),
+        timeout=30,
+    )
+    r.raise_for_status()
+    table = r.json()["data"]
+    return {f["name"]: f["id"] for f in table["fields"]}
+
+
+def to_field_ids(fields_by_name, name_to_id):
+    """Переводим словарь {имя_поля: значение} в {field_id: значение}."""
+    result = {}
+    for name, value in fields_by_name.items():
+        field_id = name_to_id.get(name)
+        if field_id:
+            result[field_id] = value
+    return result
 
 
 def fetch_all_softr_records(database_id, table_id, api_key):
@@ -169,26 +194,28 @@ def fetch_all_softr_records(database_id, table_id, api_key):
     return records
 
 
-def softr_create_record(database_id, table_id, api_key, fields):
+def softr_create_record(database_id, table_id, api_key, fields_by_id):
     r = httpx.post(
         f"{SOFTR_API_BASE}/databases/{database_id}/tables/{table_id}/records",
         headers=softr_headers(api_key),
-        params={"fieldNames": "true"},
-        json={"fields": fields},
+        json={"fields": fields_by_id},
         timeout=30,
     )
+    if r.status_code >= 400:
+        print("Softr create error:", r.status_code, r.text)
     r.raise_for_status()
     return r.json()
 
 
-def softr_update_record(database_id, table_id, api_key, record_id, fields):
+def softr_update_record(database_id, table_id, api_key, record_id, fields_by_id):
     r = httpx.patch(
         f"{SOFTR_API_BASE}/databases/{database_id}/tables/{table_id}/records/{record_id}",
         headers=softr_headers(api_key),
-        params={"fieldNames": "true"},
-        json={"fields": fields},
+        json={"fields": fields_by_id},
         timeout=30,
     )
+    if r.status_code >= 400:
+        print("Softr update error:", r.status_code, r.text)
     r.raise_for_status()
     return r.json()
 
@@ -203,6 +230,8 @@ def softr_delete_record(database_id, table_id, api_key, record_id):
 
 
 def sync_to_softr(database_id, table_id, api_key, invoices):
+    name_to_id = get_field_name_to_id_map(database_id, table_id, api_key)
+
     existing_records = fetch_all_softr_records(database_id, table_id, api_key)
     existing_by_invnum = {
         rec["fields"].get("invoice_number"): rec
@@ -221,12 +250,14 @@ def sync_to_softr(database_id, table_id, api_key, invoices):
     created, updated, deleted = 0, 0, 0
 
     for num in to_create:
-        softr_create_record(database_id, table_id, api_key, format_fields(new_map[num]))
+        fields_by_id = to_field_ids(format_fields_by_name(new_map[num]), name_to_id)
+        softr_create_record(database_id, table_id, api_key, fields_by_id)
         created += 1
 
     for num in to_update:
         record_id = existing_by_invnum[num]["id"]
-        softr_update_record(database_id, table_id, api_key, record_id, format_fields(new_map[num]))
+        fields_by_id = to_field_ids(format_fields_by_name(new_map[num]), name_to_id)
+        softr_update_record(database_id, table_id, api_key, record_id, fields_by_id)
         updated += 1
 
     for num in to_delete:
@@ -238,7 +269,7 @@ def sync_to_softr(database_id, table_id, api_key, invoices):
 
 
 def main():
-    print(f"🚀 AR sync (Softr) — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+    print(f"🚀 AR sync (Softr) — {datetime.now(timezone.utc).strftime(\'%Y-%m-%d %H:%M UTC\')}")
 
     refresh_token = get_qbo_refresh_token_from_github(os.environ["GH_PAT"])
     access_token = get_qbo_access_token(
