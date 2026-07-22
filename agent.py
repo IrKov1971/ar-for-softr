@@ -33,6 +33,24 @@ def get_qbo_refresh_token_from_github(gh_pat):
 
 # ---------- QBO (без изменений в логике относительно ar-for-comments) ----------
 
+def update_qbo_refresh_token_on_github(gh_pat, new_refresh_token):
+    """После КАЖДОГО обмена refresh_token у Intuit он ротируется — старый становится
+    недействителен независимо от того, что мы с ним делаем. Поэтому любой потребитель
+    ДОЛЖЕН записать новый токен обратно, иначе следующий читатель (например, ar-for-comments
+    по расписанию) получит протухший токен."""
+    headers = {
+        "Authorization": f"token {gh_pat.strip()}",
+        "Accept": "application/vnd.github+json",
+    }
+    r = httpx.patch(
+        f"{GITHUB_API}/repos/{QBO_TOKEN_SOURCE_REPO}/actions/variables/QBO_REFRESH_TOKEN",
+        headers=headers,
+        json={"name": "QBO_REFRESH_TOKEN", "value": new_refresh_token.strip()},
+        timeout=15,
+    )
+    r.raise_for_status()
+
+
 def get_qbo_access_token(client_id, client_secret, refresh_token):
     client_id = client_id.strip()
     client_secret = client_secret.strip()
@@ -50,9 +68,10 @@ def get_qbo_access_token(client_id, client_secret, refresh_token):
         timeout=30,
     )
     r.raise_for_status()
-    # ВАЖНО: этот скрипт НЕ пишет новый refresh_token обратно в GitHub —
-    # единственный источник правды и "хозяин" токена — ar-for-comments (см. CLAUDE.md)
-    return r.json()["access_token"]
+    data = r.json()
+    # Intuit ротирует refresh_token при каждом обмене — новый обязательно нужно
+    # сохранить, иначе следующий читатель (любой другой потребитель) получит протухший
+    return data["access_token"], data["refresh_token"]
 
 
 def qbo_query(realm_id, access_token, query):
@@ -286,11 +305,14 @@ def main():
     print(f"🚀 AR sync (Softr) — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 
     refresh_token = get_qbo_refresh_token_from_github(os.environ["GH_PAT"])
-    access_token = get_qbo_access_token(
+    access_token, new_refresh_token = get_qbo_access_token(
         os.environ["QBO_CLIENT_ID"],
         os.environ["QBO_CLIENT_SECRET"],
         refresh_token,
     )
+    # Сразу записываем новый refresh_token обратно — до того, как что-то ещё может
+    # упасть ниже — чтобы токен не протух для остальных потребителей
+    update_qbo_refresh_token_on_github(os.environ["GH_PAT"], new_refresh_token)
     realm_id = os.environ["QBO_REALM_ID"]
 
     all_invoices = fetch_unpaid_invoices(realm_id, access_token)
