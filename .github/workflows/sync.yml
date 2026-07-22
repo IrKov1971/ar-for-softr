@@ -1,7 +1,5 @@
 name: AR Sync to Softr
 on:
-  schedule:
-    - cron: "0 14 * * *"
   workflow_dispatch:
 jobs:
   sync:
